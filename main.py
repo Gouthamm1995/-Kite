@@ -48,6 +48,14 @@ REDIRECT_URL = os.environ.get("KITE_REDIRECT_URL", "http://127.0.0.1:8000/zerodh
 WORKERS = int(os.environ.get("WORKERS", "6"))
 MP_QUEUE_MAX = int(os.environ.get("MP_QUEUE_MAX", "20000"))
 
+# ✅ NEW: tick buffering flush interval
+TICK_DISPATCH_INTERVAL_MS = int(os.environ.get("TICK_DISPATCH_INTERVAL_MS", "50"))
+
+# ✅ NEW: OCO monitor polling base interval (seconds)
+OCO_POLL_BASE_S = float(os.environ.get("OCO_POLL_BASE_S", "2.0"))
+OCO_BACKOFF_MAX_S = float(os.environ.get("OCO_BACKOFF_MAX_S", "20.0"))
+
+
 # ---- helpers (env parsing) ----
 def _parse_hhmm(value: Optional[str], default: datetime.time) -> datetime.time:
     if not value:
@@ -59,8 +67,9 @@ def _parse_hhmm(value: Optional[str], default: datetime.time) -> datetime.time:
     except Exception:
         return default
 
+
 # Strategy
-NO_NEW_TRADES_AFTER = _parse_hhmm(os.environ.get("NO_NEW_TRADES_AFTER"), datetime.time(9, 45))  # 09:30 AM IST default
+NO_NEW_TRADES_AFTER = _parse_hhmm(os.environ.get("NO_NEW_TRADES_AFTER"), datetime.time(9, 45))  # default 09:45
 RISK_PER_TRADE = float(os.environ.get("RISK_PER_TRADE", "50"))
 BREAKOUT_VALUE_MIN = float(os.environ.get("BREAKOUT_VALUE_MIN", "10000000"))  # 1.0 cr
 PRODUCT = os.environ.get("PRODUCT", "MIS").upper().strip()
@@ -71,12 +80,12 @@ PENDING_TRIGGER_TIMEOUT_S = int(os.environ.get("PENDING_TRIGGER_TIMEOUT_S", "180
 
 MIN_ENTRY_PRICE = float(os.environ.get("MIN_ENTRY_PRICE", "100"))
 MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "5000"))
-MAX_TRADES = int(os.environ.get("MAX_TRADES", "6"))  # ✅ max trades = 6
+MAX_TRADES = int(os.environ.get("MAX_TRADES", "6"))
 
 # ✅ Daily max profit (squareoff all)
 DAILY_MAX_PROFIT = float(os.environ.get("DAILY_MAX_PROFIT", "750"))
 
-# ✅ NEW: SL rule
+# ✅ SL / target / trailing
 SL_PCT_BELOW_ENTRY = float(os.environ.get("SL_PCT_BELOW_ENTRY", "0.008"))  # 0.8%
 TARGET_PCT_ABOVE_ENTRY = float(os.environ.get("TARGET_PCT_ABOVE_ENTRY", "0.032"))  # 3.2%
 TRAIL_STEP_PCT = float(os.environ.get("TRAIL_STEP_PCT", "0.008"))  # 0.8% steps
@@ -86,12 +95,12 @@ REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 ACCESS_TOKEN_KEY = "access_token"
 
-# Persisted for the day (until next access_token is generated)
+# Persisted for the day
 DAY_KEY = "day_key"
 POSITIONS_SNAPSHOT_KEY = "positions_snapshot_json"
 POSITIONS_SNAPSHOT_TS_KEY = "positions_snapshot_ts"
 
-# LTP storage (hash; O(1) update per tick)
+# LTP storage
 LTP_HASH_KEY = "ltp_map"
 LTP_MAP_TS_KEY = "ltp_map_ts"
 TRADES_DONE_KEY = "trades_done"
@@ -99,6 +108,12 @@ TRADES_DONE_KEY = "trades_done"
 # ✅ Daily profit squareoff keys
 SQUAREOFF_DONE_KEY = "squareoff_done"
 TRADING_DISABLED_KEY = "trading_disabled"
+
+# ✅ NEW: Active trades set (only symbols actually in trade)
+ACTIVE_TRADES_KEY = "active_trades"
+
+# ✅ NEW: Ticks dropped counter
+TICKS_DROPPED_KEY = "ticks_dropped"
 
 # Per-symbol keys
 def k_in_trade(sym): return f"in_trade:{sym}"
@@ -108,17 +123,18 @@ def k_target(sym): return f"target:{sym}"
 def k_qty(sym): return f"qty:{sym}"
 def k_sl_oid(sym): return f"sl_order_id:{sym}"
 def k_tgt_oid(sym): return f"tgt_order_id:{sym}"
-# --- NEW: Pyramiding + Trailing management ---
-def k_base_entry(sym): return f"base_entry:{sym}"    # original entry reference (never changes)
-def k_base_qty(sym): return f"base_qty:{sym}"        # initial qty (used for add-buys)
-def k_step(sym): return f"trail_step:{sym}"          # current step number (0 → 4)
+# --- Pyramiding + Trailing management ---
+def k_base_entry(sym): return f"base_entry:{sym}"
+def k_base_qty(sym): return f"base_qty:{sym}"
+def k_step(sym): return f"trail_step:{sym}"
 
 
 # =========================
-# GLOBAL STATE (for heartbeat)
+# GLOBAL STATE (heartbeat + dropped ticks)
 # =========================
 _tick_lock = threading.Lock()
 _ticks_total = 0
+_ticks_dropped = 0
 _last_tick_ts = 0
 _last_tick_token = 0
 _last_tick_price = 0.0
@@ -127,6 +143,7 @@ _ws_connected = False
 _ws_connected_ts = 0
 _ws_last_event_ts = 0
 _ws_last_error = ""
+
 _last_ltp_ts_sec = 0
 _ltp_cache_lock = threading.Lock()
 _ltp_cache: Dict[str, float] = {}
@@ -190,8 +207,133 @@ def ensure_kite_token_global() -> bool:
     return True
 
 
+# ✅ NEW: helper to decide "accepted" (not rejected/cancelled)
+def wait_order_not_rejected_global(order_id: str, timeout_s: int = 6) -> bool:
+    """
+    True if order appears and is NOT immediately REJECTED/CANCELLED.
+    OPEN/TRIGGER PENDING/COMPLETE are treated as accepted.
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        try:
+            h = kite.order_history(order_id)
+            if not h:
+                time.sleep(0.25)
+                continue
+            st = str(h[-1].get("status", "")).upper()
+            if st in ("REJECTED", "CANCELLED"):
+                return False
+            if st:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+# ✅ NEW: safer exit replacement (SL first, confirm, then cancel old; same for target; uses modify_order if possible)
+def safe_replace_exits_global(
+    sym: str,
+    total_qty: int,
+    new_sl: float,
+    new_target: float,
+    old_sl_oid: str,
+    old_tgt_oid: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    1) SL first: try modify; else place new SL and confirm accepted; THEN cancel old SL
+    2) Target next: try modify; else place new target and confirm accepted; THEN cancel old target
+
+    If target update fails, SL is kept safe (returns (sl_oid, None)).
+    """
+    sl_oid_final: Optional[str] = None
+
+    # 1) SL first
+    if old_sl_oid:
+        try:
+            kite.modify_order(
+                variety=kite.VARIETY_REGULAR,
+                order_id=old_sl_oid,
+                quantity=int(total_qty),
+                trigger_price=float(new_sl),
+            )
+            if wait_order_not_rejected_global(old_sl_oid, timeout_s=4):
+                sl_oid_final = old_sl_oid
+        except Exception:
+            sl_oid_final = None
+
+    if sl_oid_final is None:
+        try:
+            new_sl_oid = kite.place_order(
+                variety=kite.VARIETY_REGULAR,
+                exchange=EXCHANGE,
+                tradingsymbol=sym,
+                transaction_type=kite.TRANSACTION_TYPE_SELL,
+                quantity=int(total_qty),
+                product=PRODUCT,
+                order_type=kite.ORDER_TYPE_SLM,
+                trigger_price=float(new_sl),
+            )
+            if not wait_order_not_rejected_global(new_sl_oid, timeout_s=6):
+                # Don't cancel old SL if new SL wasn't accepted
+                return None, None
+
+            sl_oid_final = new_sl_oid
+
+            if old_sl_oid:
+                try:
+                    kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=old_sl_oid)
+                except Exception:
+                    pass
+        except Exception:
+            return None, None
+
+    # 2) Target second
+    tgt_oid_final: Optional[str] = None
+
+    if old_tgt_oid:
+        try:
+            kite.modify_order(
+                variety=kite.VARIETY_REGULAR,
+                order_id=old_tgt_oid,
+                quantity=int(total_qty),
+                price=float(new_target),
+            )
+            if wait_order_not_rejected_global(old_tgt_oid, timeout_s=4):
+                tgt_oid_final = old_tgt_oid
+        except Exception:
+            tgt_oid_final = None
+
+    if tgt_oid_final is None:
+        try:
+            new_tgt_oid = kite.place_order(
+                variety=kite.VARIETY_REGULAR,
+                exchange=EXCHANGE,
+                tradingsymbol=sym,
+                transaction_type=kite.TRANSACTION_TYPE_SELL,
+                quantity=int(total_qty),
+                product=PRODUCT,
+                order_type=kite.ORDER_TYPE_LIMIT,
+                price=float(new_target),
+            )
+            if not wait_order_not_rejected_global(new_tgt_oid, timeout_s=6):
+                return sl_oid_final, None
+
+            tgt_oid_final = new_tgt_oid
+
+            if old_tgt_oid:
+                try:
+                    kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=old_tgt_oid)
+                except Exception:
+                    pass
+        except Exception:
+            return sl_oid_final, None
+
+    return sl_oid_final, tgt_oid_final
+
+
 # =========================
-# LOAD UNIVERSE (allowed_stocks.json [+ optional derivative filter])
+# LOAD UNIVERSE
 # =========================
 ALLOWED_STOCKS_PATH = Path(os.environ.get("ALLOWED_STOCKS_PATH", str(BASE_DIR / "allowed_stocks.json")))
 DERIVATIVE_STOCKS_PATH = Path(os.environ.get("DERIVATIVE_STOCKS_PATH", str(BASE_DIR / "derivative_stocks.txt")))
@@ -231,7 +373,7 @@ token_to_symbol = {v: k for k, v in allowed_stocks.items()}
 
 
 # =========================
-# INSTRUMENT META (tick size) for order price rounding
+# INSTRUMENT META (tick size)
 # =========================
 INSTRUMENTS_CSV_PATH = Path(os.environ.get("INSTRUMENTS_CSV_PATH", str(BASE_DIR / "kite_instruments.csv")))
 TICK_SIZE_DEFAULT = float(os.environ.get("TICK_SIZE_DEFAULT", "0.05"))
@@ -287,7 +429,7 @@ def ceil_to_tick(price: float, tick: float) -> float:
 
 
 # =========================
-# MULTIPROCESSING ROUTING
+# MULTIPROCESSING ROUTING + ✅ LATEST TICK BUFFERING
 # =========================
 TOKENS_SORTED = sorted([int(t) for t in allowed_stocks.values()])
 TOKEN_TO_WORKER = {tok: (i % WORKERS) for i, tok in enumerate(TOKENS_SORTED)}
@@ -298,6 +440,10 @@ for tok, wid in TOKEN_TO_WORKER.items():
 _worker_procs: List[mp.Process] = []
 _worker_queues: List[Any] = []
 _workers_started = False
+
+# ✅ buffer: worker_id -> {token_str: tick_dict}
+_latest_ticks_by_worker: List[Dict[int, dict]] = [dict() for _ in range(WORKERS)]
+_latest_ticks_locks: List[threading.Lock] = [threading.Lock() for _ in range(WORKERS)]
 
 
 def _start_workers_if_needed():
@@ -320,6 +466,63 @@ def _start_workers_if_needed():
     log.info("Started %s worker processes", WORKERS)
     log.info("Token distribution: %s", _worker_token_counts)
 
+    # ✅ dispatcher thread: flush latest tick per token (per worker) into mp queues
+    threading.Thread(target=_tick_dispatch_loop, daemon=True).start()
+
+
+def _inc_ticks_dropped(n: int = 1):
+    global _ticks_dropped
+    with _tick_lock:
+        _ticks_dropped += int(n)
+    try:
+        if redis_ok():
+            r.incrby(TICKS_DROPPED_KEY, int(n))
+    except Exception:
+        pass
+
+
+def _buffer_tick_for_worker(wid: int, tick: dict):
+    token = tick.get("instrument_token")
+    if token is None:
+        return
+    try:
+        tok = int(token)
+    except Exception:
+        return
+
+    # store latest tick for that token (overwrite)
+    try:
+        with _latest_ticks_locks[int(wid)]:
+            _latest_ticks_by_worker[int(wid)][tok] = tick
+    except Exception:
+        pass
+
+
+def _tick_dispatch_loop():
+    """
+    Flush latest ticks (one per token) into worker queues every TICK_DISPATCH_INTERVAL_MS.
+    This prevents queue blow-up and drops older ticks automatically.
+    """
+    interval_s = max(0.01, float(TICK_DISPATCH_INTERVAL_MS) / 1000.0)
+
+    while True:
+        time.sleep(interval_s)
+
+        for wid in range(WORKERS):
+            # drain snapshot
+            with _latest_ticks_locks[wid]:
+                if not _latest_ticks_by_worker[wid]:
+                    continue
+                batch = list(_latest_ticks_by_worker[wid].values())
+                _latest_ticks_by_worker[wid].clear()
+
+            # enqueue
+            for t in batch:
+                try:
+                    _worker_queues[wid].put_nowait(t)
+                except Exception:
+                    _inc_ticks_dropped(1)
+
 
 def _route_tick_to_worker(tick: dict):
     global _ticks_total, _last_tick_ts, _last_tick_token, _last_tick_price, _ws_last_event_ts
@@ -328,7 +531,12 @@ def _route_tick_to_worker(tick: dict):
     if token is None:
         return
 
-    wid = TOKEN_TO_WORKER.get(int(token), 0)
+    try:
+        tok = int(token)
+    except Exception:
+        return
+
+    wid = TOKEN_TO_WORKER.get(tok, 0)
 
     lp = tick.get("last_price")
     now = int(time.time())
@@ -336,22 +544,20 @@ def _route_tick_to_worker(tick: dict):
     with _tick_lock:
         _ticks_total += 1
         _last_tick_ts = now
-        _last_tick_token = int(token)
+        _last_tick_token = tok
         _last_tick_price = float(lp) if lp is not None else 0.0
         _ws_last_event_ts = now
 
-    # store LTP for UI (in-memory; flushed to Redis in batches by ltp_flush_loop)
+    # store LTP for UI (in-memory; flushed to Redis)
     if lp is not None:
         try:
             with _ltp_cache_lock:
-                _ltp_cache[str(int(token))] = float(lp)
+                _ltp_cache[str(tok)] = float(lp)
         except Exception:
             pass
 
-    try:
-        _worker_queues[int(wid)].put_nowait(tick)
-    except Exception:
-        pass
+    # ✅ buffer instead of queueing all ticks
+    _buffer_tick_for_worker(int(wid), tick)
 
 
 # =========================
@@ -380,7 +586,6 @@ def to_ist(dt: datetime.datetime) -> datetime.datetime:
 
 
 def within_new_trade_window(ts: datetime.datetime) -> bool:
-    # ✅ stop all new trades if daily profit squareoff has happened
     try:
         if redis_ok() and (r.get(TRADING_DISABLED_KEY) or "").strip() == "1":
             return False
@@ -406,7 +611,6 @@ def squareoff_all_positions_if_profit_hit():
                 time.sleep(1)
                 continue
 
-            # already executed?
             if (r.get(SQUAREOFF_DONE_KEY) or "").strip() == "1":
                 time.sleep(2)
                 continue
@@ -435,16 +639,13 @@ def squareoff_all_positions_if_profit_hit():
                 open_rows.append((sym, qty))
 
             if total_pnl >= float(DAILY_MAX_PROFIT) and open_rows:
-                # lock once
                 r.set(SQUAREOFF_DONE_KEY, "1")
                 r.set(TRADING_DISABLED_KEY, "1")
 
                 log.info("✅ DAILY PROFIT HIT %.2f >= %.2f. SQUAREOFF START.", total_pnl, float(DAILY_MAX_PROFIT))
 
-                # cancel exit orders + squareoff all
                 for sym, qty in open_rows:
                     try:
-                        # cancel SL/TGT from redis if present (best effort)
                         sl_oid = (r.get(k_sl_oid(sym)) or "").strip()
                         tgt_oid = (r.get(k_tgt_oid(sym)) or "").strip()
                         if sl_oid:
@@ -469,7 +670,7 @@ def squareoff_all_positions_if_profit_hit():
                             order_type=kite.ORDER_TYPE_MARKET,
                         )
 
-                        # clear local state keys (best effort)
+                        # clear local keys
                         r.delete(k_in_trade(sym))
                         r.delete(k_entry(sym))
                         r.delete(k_sl(sym))
@@ -481,11 +682,16 @@ def squareoff_all_positions_if_profit_hit():
                         r.delete(k_base_qty(sym))
                         r.delete(k_step(sym))
 
+                        # ✅ remove from active set
+                        try:
+                            r.srem(ACTIVE_TRADES_KEY, sym)
+                        except Exception:
+                            pass
+
                     except Exception:
                         pass
 
                 log.info("✅ SQUAREOFF DONE. Trading disabled for the day.")
-
         except Exception:
             pass
 
@@ -529,7 +735,7 @@ def worker_main(worker_id: int, q: mp.Queue):
         try:
             mapping = {k: (json.dumps(v) if isinstance(v, (dict, list)) else str(v)) for k, v in fields.items()}
             r_local.hset(_diag_key(sym), mapping=mapping)
-            r_local.expire(_diag_key(sym), 60 * 60 * 16)  # trading-day TTL
+            r_local.expire(_diag_key(sym), 60 * 60 * 16)
         except Exception:
             pass
 
@@ -554,23 +760,139 @@ def worker_main(worker_id: int, q: mp.Queue):
             time.sleep(0.4)
         return False, 0.0
 
+    def wait_not_rejected_local(order_id: str, timeout_s: int = 6) -> bool:
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            try:
+                h = kite_local.order_history(order_id)
+                if not h:
+                    time.sleep(0.25)
+                    continue
+                st = str(h[-1].get("status", "")).upper()
+                if st in ("REJECTED", "CANCELLED"):
+                    return False
+                if st:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return False
+
+    def safe_replace_exits_local(
+        sym: str,
+        total_qty: int,
+        new_sl: float,
+        new_target: float,
+        old_sl_oid: str,
+        old_tgt_oid: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        ✅ Worker-safe exit update:
+          - SL first (modify if possible, else place new+confirm, then cancel old)
+          - Target next (same)
+        """
+        sl_oid_final: Optional[str] = None
+
+        # SL first
+        if old_sl_oid:
+            try:
+                kite_local.modify_order(
+                    variety=kite_local.VARIETY_REGULAR,
+                    order_id=old_sl_oid,
+                    quantity=int(total_qty),
+                    trigger_price=float(new_sl),
+                )
+                if wait_not_rejected_local(old_sl_oid, timeout_s=4):
+                    sl_oid_final = old_sl_oid
+            except Exception:
+                sl_oid_final = None
+
+        if sl_oid_final is None:
+            try:
+                new_sl_oid = kite_local.place_order(
+                    variety=kite_local.VARIETY_REGULAR,
+                    exchange=EXCHANGE,
+                    tradingsymbol=sym,
+                    transaction_type=kite_local.TRANSACTION_TYPE_SELL,
+                    quantity=int(total_qty),
+                    product=PRODUCT,
+                    order_type=kite_local.ORDER_TYPE_SLM,
+                    trigger_price=float(new_sl),
+                )
+                if not wait_not_rejected_local(new_sl_oid, timeout_s=6):
+                    return None, None
+
+                sl_oid_final = new_sl_oid
+                if old_sl_oid:
+                    try:
+                        kite_local.cancel_order(variety=kite_local.VARIETY_REGULAR, order_id=old_sl_oid)
+                    except Exception:
+                        pass
+            except Exception:
+                return None, None
+
+        # Target next
+        tgt_oid_final: Optional[str] = None
+
+        if old_tgt_oid:
+            try:
+                kite_local.modify_order(
+                    variety=kite_local.VARIETY_REGULAR,
+                    order_id=old_tgt_oid,
+                    quantity=int(total_qty),
+                    price=float(new_target),
+                )
+                if wait_not_rejected_local(old_tgt_oid, timeout_s=4):
+                    tgt_oid_final = old_tgt_oid
+            except Exception:
+                tgt_oid_final = None
+
+        if tgt_oid_final is None:
+            try:
+                new_tgt_oid = kite_local.place_order(
+                    variety=kite_local.VARIETY_REGULAR,
+                    exchange=EXCHANGE,
+                    tradingsymbol=sym,
+                    transaction_type=kite_local.TRANSACTION_TYPE_SELL,
+                    quantity=int(total_qty),
+                    product=PRODUCT,
+                    order_type=kite_local.ORDER_TYPE_LIMIT,
+                    price=float(new_target),
+                )
+                if not wait_not_rejected_local(new_tgt_oid, timeout_s=6):
+                    return sl_oid_final, None
+
+                tgt_oid_final = new_tgt_oid
+                if old_tgt_oid:
+                    try:
+                        kite_local.cancel_order(variety=kite_local.VARIETY_REGULAR, order_id=old_tgt_oid)
+                    except Exception:
+                        pass
+            except Exception:
+                return sl_oid_final, None
+
+        return sl_oid_final, tgt_oid_final
+
+    def add_active(sym: str):
+        try:
+            r_local.sadd(ACTIVE_TRADES_KEY, sym)
+        except Exception:
+            pass
+
+    def remove_active(sym: str):
+        try:
+            r_local.srem(ACTIVE_TRADES_KEY, sym)
+        except Exception:
+            pass
+
     # ==========================================================
-    # ✅ TRAILING + PYRAMIDING MANAGER (TICK-LEVEL)
+    # TRAILING + PYRAMIDING MANAGER (TICK-LEVEL)
     # ==========================================================
     def manage_trailing_and_pyramiding(sym: str, ltp: float):
-        """
-        Steps:
-          step 0: entered. SL = entry*(1-0.8%), target = entry*(1+3.2%)
-          when ltp >= entry*(1+0.8%): step->1, BUY add, SL->entry
-          when ltp >= entry*(1+1.6%): step->2, BUY add, SL->entry*(1+0.8%)
-          when ltp >= entry*(1+2.4%): step->3, BUY add, SL->entry*(1+1.6%)
-          step 4 corresponds to 3.2% target level (we do NOT add buy at step 4)
-        """
         try:
             if not r_local.get(k_in_trade(sym)):
                 return
 
-            # ✅ if trading disabled (daily squareoff), don't do anything
             if (r_local.get(TRADING_DISABLED_KEY) or "").strip() == "1":
                 return
 
@@ -604,8 +926,8 @@ def worker_main(worker_id: int, q: mp.Queue):
 
             new_step = next_step
 
-            new_sl_level = base_entry * (1.0 + float(TRAIL_STEP_PCT) * max(0, new_step - 1))
             t = tick_size(sym)
+            new_sl_level = base_entry * (1.0 + float(TRAIL_STEP_PCT) * max(0, new_step - 1))
             new_sl_level = floor_to_tick(new_sl_level, t)
 
             new_target = base_entry * (1.0 + float(TARGET_PCT_ABOVE_ENTRY))
@@ -622,7 +944,7 @@ def worker_main(worker_id: int, q: mp.Queue):
             if total_qty <= 0:
                 total_qty = base_qty
 
-            # 1) optional add buy
+            # optional add buy
             if add_buy:
                 try:
                     buy_oid2 = kite_local.place_order(
@@ -644,43 +966,25 @@ def worker_main(worker_id: int, q: mp.Queue):
                 except Exception as e:
                     diag_set(sym, pyramid_buy_error_step=new_step, pyramid_buy_error=str(e))
 
-            # 2) cancel old exits (both), then place new exits for UPDATED total qty
+            # ✅ safer exit replacement (SL first, confirm, then cancel old; same for target; uses modify when possible)
             try:
-                try:
-                    kite_local.cancel_order(variety=kite_local.VARIETY_REGULAR, order_id=tgt_oid)
-                except Exception:
-                    pass
-                try:
-                    kite_local.cancel_order(variety=kite_local.VARIETY_REGULAR, order_id=sl_oid)
-                except Exception:
-                    pass
-
-                new_sl_oid = kite_local.place_order(
-                    variety=kite_local.VARIETY_REGULAR,
-                    exchange=EXCHANGE,
-                    tradingsymbol=sym,
-                    transaction_type=kite_local.TRANSACTION_TYPE_SELL,
-                    quantity=int(total_qty),
-                    product=PRODUCT,
-                    order_type=kite_local.ORDER_TYPE_SLM,
-                    trigger_price=float(new_sl_level),
+                new_sl_oid, new_tgt_oid = safe_replace_exits_local(
+                    sym=sym,
+                    total_qty=int(total_qty),
+                    new_sl=float(new_sl_level),
+                    new_target=float(new_target),
+                    old_sl_oid=sl_oid,
+                    old_tgt_oid=tgt_oid,
                 )
-
-                new_tgt_oid = kite_local.place_order(
-                    variety=kite_local.VARIETY_REGULAR,
-                    exchange=EXCHANGE,
-                    tradingsymbol=sym,
-                    transaction_type=kite_local.TRANSACTION_TYPE_SELL,
-                    quantity=int(total_qty),
-                    product=PRODUCT,
-                    order_type=kite_local.ORDER_TYPE_LIMIT,
-                    price=float(new_target),
-                )
+                if not new_sl_oid:
+                    diag_set(sym, trail_exit_replace_error="sl_update_failed", trail_exit_replace_error_ts=int(time.time()))
+                    return
 
                 r_local.set(k_sl(sym), str(float(new_sl_level)))
                 r_local.set(k_target(sym), str(float(new_target)))
                 r_local.set(k_sl_oid(sym), str(new_sl_oid))
-                r_local.set(k_tgt_oid(sym), str(new_tgt_oid))
+                if new_tgt_oid:
+                    r_local.set(k_tgt_oid(sym), str(new_tgt_oid))
                 r_local.set(k_step(sym), str(int(new_step)))
 
                 diag_set(
@@ -691,7 +995,6 @@ def worker_main(worker_id: int, q: mp.Queue):
                     total_qty=int(total_qty),
                     trail_update_ts=int(time.time()),
                 )
-
             except Exception as e:
                 diag_set(sym, trail_exit_replace_error=str(e), trail_exit_replace_error_ts=int(time.time()))
 
@@ -699,15 +1002,11 @@ def worker_main(worker_id: int, q: mp.Queue):
             pass
 
     # ==========================================================
-    # ✅ REST OPENING CANDLES (ONE CALL, IST-NORMALIZED)
+    # REST OPENING CANDLES (ONE CALL)
     # ==========================================================
-    _rest_opening: Dict[str, dict] = {}  # sym -> {"c915":..., "c916":...}
+    _rest_opening: Dict[str, dict] = {}
 
     def fetch_opening_candles(sym: str) -> Optional[dict]:
-        """
-        Fetch 09:15 candle (and 09:16 if available) in ONE REST call.
-        Range: 09:15 -> 09:18 (small buffer), then extract exact minutes by IST.
-        """
         try:
             tok = allowed_stocks.get(sym)
             if not tok:
@@ -769,10 +1068,6 @@ def worker_main(worker_id: int, q: mp.Queue):
             return None
 
     def try_lock_opening_from_rest(sym: str, ts: datetime.datetime, m: dict):
-        """
-        Lock opening reference once time >= 09:16 IST (so 09:15 candle is complete).
-        Single attempt only.
-        """
         if m.get("open_locked") or m.get("ignored"):
             return
 
@@ -837,6 +1132,7 @@ def worker_main(worker_id: int, q: mp.Queue):
             m["day_high"] = float(max(h1, float(c916["high"])))
         else:
             m["day_high"] = float(h1)
+
         diag_set(
             sym,
             open_locked=1,
@@ -849,34 +1145,69 @@ def worker_main(worker_id: int, q: mp.Queue):
         )
 
     # ==========================================================
-    # ✅ OCO MONITOR (CANCEL OTHER EXIT ORDER)
+    # ✅ OCO MONITOR: ONLY ACTIVE TRADES + SLOWER POLL + BACKOFF
     # ==========================================================
-    def monitor_exit_orders():
+    def monitor_exit_orders_active():
+        backoff: Dict[str, float] = {}  # sym -> backoff seconds
+        last_run: Dict[str, float] = {}  # sym -> last check timestamp
+
+        def status_of(oid: str) -> str:
+            try:
+                h = kite_local.order_history(oid)
+                if not h:
+                    return ""
+                return str(h[-1].get("status", "")).upper()
+            except Exception:
+                return ""
+
         while True:
             try:
                 refresh_token()
 
-                # ✅ if trading disabled, we still let exits complete, but don't do extra logic
-                for sym in list(mem.keys()):
-                    if not r_local.get(k_in_trade(sym)):
+                try:
+                    active_syms = list(r_local.smembers(ACTIVE_TRADES_KEY) or [])
+                except Exception:
+                    active_syms = []
+
+                now = time.time()
+                for sym in active_syms:
+                    sym = str(sym).upper().strip()
+                    if not sym:
                         continue
+
+                    tok = allowed_stocks.get(sym)
+                    if tok is None:
+                        remove_active(sym)
+                        continue
+
+                    # each worker monitors only its own symbols
+                    if TOKEN_TO_WORKER.get(int(tok), 0) != worker_id:
+                        continue
+
+                    # If no longer in trade, stop monitoring
+                    if not r_local.get(k_in_trade(sym)):
+                        remove_active(sym)
+                        continue
+
+                    # backoff scheduling
+                    b = float(backoff.get(sym, OCO_POLL_BASE_S))
+                    lr = float(last_run.get(sym, 0.0))
+                    if (now - lr) < b:
+                        continue
+                    last_run[sym] = now
 
                     sl_oid = (r_local.get(k_sl_oid(sym)) or "").strip()
                     tgt_oid = (r_local.get(k_tgt_oid(sym)) or "").strip()
                     if not sl_oid or not tgt_oid:
+                        # incomplete data -> increase backoff
+                        backoff[sym] = min(OCO_BACKOFF_MAX_S, max(OCO_POLL_BASE_S, b * 2.0))
                         continue
-
-                    def status_of(oid: str) -> str:
-                        try:
-                            h = kite_local.order_history(oid)
-                            if not h:
-                                return ""
-                            return str(h[-1].get("status", "")).upper()
-                        except Exception:
-                            return ""
 
                     sl_st = status_of(sl_oid)
                     tg_st = status_of(tgt_oid)
+
+                    # reset backoff on successful fetch
+                    backoff[sym] = OCO_POLL_BASE_S
 
                     if sl_st == "COMPLETE" and tg_st not in ("CANCELLED", "REJECTED", "COMPLETE"):
                         try:
@@ -891,6 +1222,7 @@ def worker_main(worker_id: int, q: mp.Queue):
                             pass
 
                     if sl_st == "COMPLETE" or tg_st == "COMPLETE":
+                        # clear state
                         r_local.delete(k_in_trade(sym))
                         r_local.delete(k_entry(sym))
                         r_local.delete(k_sl(sym))
@@ -902,10 +1234,15 @@ def worker_main(worker_id: int, q: mp.Queue):
                         r_local.delete(k_base_qty(sym))
                         r_local.delete(k_step(sym))
 
+                        remove_active(sym)
+                        backoff.pop(sym, None)
+                        last_run.pop(sym, None)
+
             except Exception:
+                # global monitor error -> tiny sleep
                 pass
 
-            time.sleep(1)
+            time.sleep(0.25)
 
     refresh_token()
     log.info("[WORKER %s] started", worker_id)
@@ -913,9 +1250,9 @@ def worker_main(worker_id: int, q: mp.Queue):
     candle_1m: Dict[str, dict] = {}
     mem: Dict[str, dict] = {}
     pending_next_open: Dict[str, dict] = {}
-    pending_breakout: Dict[str, dict] = {}  # FIRST_CANDLE mode: wait for breakout-candle high to break
+    pending_breakout: Dict[str, dict] = {}
 
-    threading.Thread(target=monitor_exit_orders, daemon=True).start()
+    threading.Thread(target=monitor_exit_orders_active, daemon=True).start()
 
     while True:
         tick = q.get()
@@ -932,7 +1269,6 @@ def worker_main(worker_id: int, q: mp.Queue):
 
             refresh_token()
 
-            # ✅ if daily profit squareoff hit, do nothing in worker
             if (r_local.get(TRADING_DISABLED_KEY) or "").strip() == "1":
                 continue
 
@@ -972,7 +1308,6 @@ def worker_main(worker_id: int, q: mp.Queue):
                 if not m.get("open_locked") or not m.get("pattern_ok"):
                     return
 
-                # ✅ hard stop if daily profit squareoff hit
                 if (r_local.get(TRADING_DISABLED_KEY) or "").strip() == "1":
                     pending_breakout.pop(sym, None)
                     return
@@ -1045,14 +1380,7 @@ def worker_main(worker_id: int, q: mp.Queue):
                         diag_set(sym, last_order_error="missing_access_token", last_order_error_ts=now_i)
                         return
 
-                    diag_set(
-                        sym,
-                        last_order_attempt_ts=now_i,
-                        entry=entry_ref,
-                        trigger=trigger,
-                        sl=sl,
-                        qty=int(qty),
-                    )
+                    diag_set(sym, last_order_attempt_ts=now_i, entry=entry_ref, trigger=trigger, sl=sl, qty=int(qty))
 
                     buy_oid = kite_local.place_order(
                         variety=kite_local.VARIETY_REGULAR,
@@ -1112,6 +1440,9 @@ def worker_main(worker_id: int, q: mp.Queue):
                     r_local.set(k_base_qty(sym), str(int(qty)))
                     r_local.set(k_step(sym), "0")
 
+                    # ✅ track active trade
+                    add_active(sym)
+
                     try:
                         r_local.incr(TRADES_DONE_KEY)
                     except Exception:
@@ -1141,7 +1472,6 @@ def worker_main(worker_id: int, q: mp.Queue):
                 if not pe or pe["next_minute"] != minute_dt:
                     return
 
-                # ✅ hard stop if daily profit squareoff hit
                 if (r_local.get(TRADING_DISABLED_KEY) or "").strip() == "1":
                     pending_next_open.pop(sym, None)
                     return
@@ -1211,12 +1541,7 @@ def worker_main(worker_id: int, q: mp.Queue):
 
                     filled, avg_fill = wait_for_complete_and_avg(buy_oid, timeout_s=10)
                     if not filled or avg_fill <= 0:
-                        diag_set(
-                            sym,
-                            last_order_error="buy_not_filled",
-                            buy_order_id=buy_oid,
-                            last_order_error_ts=int(time.time())
-                        )
+                        diag_set(sym, last_order_error="buy_not_filled", buy_order_id=buy_oid, last_order_error_ts=int(time.time()))
                         pending_next_open.pop(sym, None)
                         return
 
@@ -1259,6 +1584,9 @@ def worker_main(worker_id: int, q: mp.Queue):
                     r_local.set(k_qty(sym), str(int(qty)))
                     r_local.set(k_sl_oid(sym), str(sl_oid))
                     r_local.set(k_tgt_oid(sym), str(tgt_oid))
+
+                    # ✅ track active trade
+                    add_active(sym)
 
                     try:
                         r_local.incr(TRADES_DONE_KEY)
@@ -1329,9 +1657,7 @@ def worker_main(worker_id: int, q: mp.Queue):
                         if c_high > prev_day_high:
                             ok, _val = breakout_value_ok(c_close, float(vol_1m))
                             if ok:
-                                pending_next_open[sym] = {
-                                    "next_minute": minute_bucket,
-                                }
+                                pending_next_open[sym] = {"next_minute": minute_bucket}
                                 diag_set(
                                     sym,
                                     pending_next_open=minute_bucket.isoformat(),
@@ -1387,7 +1713,7 @@ def worker_main(worker_id: int, q: mp.Queue):
 
 
 # =========================
-# KITE TICKER (FULL MODE)
+# KITE TICKER
 # =========================
 ticker_started = False
 ticker_running = False
@@ -1440,6 +1766,7 @@ async def run_ticker():
             _ws_last_error = ""
         tokens = list(allowed_stocks.values())
         ws.subscribe(tokens)
+        # NOTE: Keeping FULL because your strategy uses volume/exchange_timestamp.
         ws.set_mode(ws.MODE_FULL, tokens)
 
     def on_close(ws, code, reason):
@@ -1497,7 +1824,7 @@ def start_ticker_background():
 
 
 # =========================
-# POSITIONS SNAPSHOT UPDATER (for UI, low latency)
+# POSITIONS SNAPSHOT UPDATER
 # =========================
 def positions_snapshot_loop():
     while True:
@@ -1577,6 +1904,7 @@ def positions_snapshot_loop():
                 "daily_max_profit": DAILY_MAX_PROFIT,
                 "trading_disabled": bool((r.get(TRADING_DISABLED_KEY) or "").strip() == "1"),
                 "squareoff_done": bool((r.get(SQUAREOFF_DONE_KEY) or "").strip() == "1"),
+                "active_trades_count": int(r.scard(ACTIVE_TRADES_KEY) or 0),
             }
             r.set(POSITIONS_SNAPSHOT_KEY, json.dumps(snap))
             r.set(POSITIONS_SNAPSHOT_TS_KEY, str(snap["ts"]))
@@ -1594,9 +1922,11 @@ def positions_snapshot_loop():
 def health():
     now = int(time.time())
     redis_up = redis_ok()
+
     with _tick_lock:
         last_ts = int(_last_tick_ts or 0)
         ticks_total = int(_ticks_total)
+        ticks_dropped_local = int(_ticks_dropped)
         last_token = int(_last_tick_token or 0)
         last_price = float(_last_tick_price or 0.0)
 
@@ -1618,10 +1948,16 @@ def health():
 
     trading_disabled = False
     squareoff_done = False
+    active_count = 0
+    ticks_dropped_redis = None
+
     if redis_up:
         try:
             trading_disabled = bool((r.get(TRADING_DISABLED_KEY) or "").strip() == "1")
             squareoff_done = bool((r.get(SQUAREOFF_DONE_KEY) or "").strip() == "1")
+            active_count = int(r.scard(ACTIVE_TRADES_KEY) or 0)
+            td = (r.get(TICKS_DROPPED_KEY) or "").strip()
+            ticks_dropped_redis = int(td) if td else 0
         except Exception:
             pass
 
@@ -1641,6 +1977,8 @@ def health():
         "ltp_backend": "redis_hash",
         "ticker_running": ticker_running,
         "ticks_total": ticks_total,
+        "ticks_dropped_local": ticks_dropped_local,
+        "ticks_dropped_redis": ticks_dropped_redis,
         "last_tick_ts": last_ts,
         "last_tick_age_s": tick_age,
         "last_tick_token": last_token,
@@ -1653,6 +1991,8 @@ def health():
         "daily_max_profit": DAILY_MAX_PROFIT,
         "trading_disabled": trading_disabled,
         "squareoff_done": squareoff_done,
+        "active_trades_count": active_count,
+        "tick_dispatch_interval_ms": TICK_DISPATCH_INTERVAL_MS,
     }
 
 
@@ -1682,6 +2022,7 @@ def state():
             "daily_max_profit": DAILY_MAX_PROFIT,
             "trading_disabled": bool((r.get(TRADING_DISABLED_KEY) or "").strip() == "1") if redis_ok() else False,
             "squareoff_done": bool((r.get(SQUAREOFF_DONE_KEY) or "").strip() == "1") if redis_ok() else False,
+            "active_trades_count": int(r.scard(ACTIVE_TRADES_KEY) or 0) if redis_ok() else 0,
         },
         "positions_ts": ts,
     }
@@ -1705,6 +2046,9 @@ def universe():
         "max_entry_price": MAX_ENTRY_PRICE,
         "max_trades": MAX_TRADES,
         "daily_max_profit": DAILY_MAX_PROFIT,
+        "tick_dispatch_interval_ms": TICK_DISPATCH_INTERVAL_MS,
+        "oco_poll_base_s": OCO_POLL_BASE_S,
+        "oco_backoff_max_s": OCO_BACKOFF_MAX_S,
     }
 
 
@@ -1737,9 +2081,18 @@ async def callback(request: Request):
         r.set(ACCESS_TOKEN_KEY, access_token)
         r.set(DAY_KEY, str(int(time.time())))
         r.set(TRADES_DONE_KEY, "0")
-        # ✅ reset daily squareoff flags on new login/session
         r.set(TRADING_DISABLED_KEY, "0")
         r.set(SQUAREOFF_DONE_KEY, "0")
+
+        # ✅ reset active set + dropped counter each login/session (optional, but safest)
+        try:
+            r.delete(ACTIVE_TRADES_KEY)
+        except Exception:
+            pass
+        try:
+            r.set(TICKS_DROPPED_KEY, "0")
+        except Exception:
+            pass
 
     kite.set_access_token(access_token)
 
@@ -1770,19 +2123,8 @@ def set_override(symbol: str = Form(...), sl: str = Form(...), target: str = For
     t_v = ceil_to_tick(t_v, t)
 
     try:
-        sl_oid = (r.get(k_sl_oid(sym)) or "").strip()
-        tgt_oid = (r.get(k_tgt_oid(sym)) or "").strip()
-
-        if sl_oid:
-            try:
-                kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=sl_oid)
-            except Exception:
-                pass
-        if tgt_oid:
-            try:
-                kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=tgt_oid)
-            except Exception:
-                pass
+        old_sl_oid = (r.get(k_sl_oid(sym)) or "").strip()
+        old_tgt_oid = (r.get(k_tgt_oid(sym)) or "").strip()
 
         qty = int(r.get(k_qty(sym)) or "0")
         if qty <= 0:
@@ -1795,34 +2137,44 @@ def set_override(symbol: str = Form(...), sl: str = Form(...), target: str = For
         if qty <= 0:
             return JSONResponse({"ok": False, "error": "No quantity found for symbol"}, status_code=400)
 
-        new_sl_oid = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=EXCHANGE,
-            tradingsymbol=sym,
-            transaction_type=kite.TRANSACTION_TYPE_SELL,
-            quantity=int(qty),
-            product=PRODUCT,
-            order_type=kite.ORDER_TYPE_SLM,
-            trigger_price=float(sl_v),
-        )
-        new_tgt_oid = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=EXCHANGE,
-            tradingsymbol=sym,
-            transaction_type=kite.TRANSACTION_TYPE_SELL,
-            quantity=int(qty),
-            product=PRODUCT,
-            order_type=kite.ORDER_TYPE_LIMIT,
-            price=float(t_v),
+        # ✅ Safer replace: SL first (confirm), then target. Uses modify_order when possible.
+        new_sl_oid, new_tgt_oid = safe_replace_exits_global(
+            sym=sym,
+            total_qty=int(qty),
+            new_sl=float(sl_v),
+            new_target=float(t_v),
+            old_sl_oid=old_sl_oid,
+            old_tgt_oid=old_tgt_oid,
         )
 
-        r.set(k_sl(sym), str(sl_v))
-        r.set(k_target(sym), str(t_v))
+        if not new_sl_oid:
+            return JSONResponse({"ok": False, "error": "SL update failed (kept old SL if present)."}, status_code=500)
+
+        r.set(k_sl(sym), str(float(sl_v)))
+        r.set(k_target(sym), str(float(t_v)))
         r.set(k_qty(sym), str(int(qty)))
         r.set(k_sl_oid(sym), str(new_sl_oid))
-        r.set(k_tgt_oid(sym), str(new_tgt_oid))
+        if new_tgt_oid:
+            r.set(k_tgt_oid(sym), str(new_tgt_oid))
 
-        return {"ok": True, "symbol": sym, "sl": sl_v, "target": t_v, "qty": qty}
+        # ✅ ensure symbol tracked if in_trade
+        if (r.get(k_in_trade(sym)) or "").strip():
+            try:
+                r.sadd(ACTIVE_TRADES_KEY, sym)
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "symbol": sym,
+            "sl": float(sl_v),
+            "target": float(t_v),
+            "qty": int(qty),
+            "sl_order_id": str(new_sl_oid),
+            "tgt_order_id": (str(new_tgt_oid) if new_tgt_oid else ""),
+            "target_update_ok": bool(new_tgt_oid),
+        }
+
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -1839,6 +2191,7 @@ def exit_symbol(symbol: str):
     try:
         sl_oid = (r.get(k_sl_oid(sym)) or "").strip()
         tgt_oid = (r.get(k_tgt_oid(sym)) or "").strip()
+
         if sl_oid:
             try:
                 kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=sl_oid)
@@ -1857,6 +2210,11 @@ def exit_symbol(symbol: str):
                 qty = int(p.get("quantity", 0))
                 break
         if qty == 0:
+            # cleanup anyway
+            try:
+                r.srem(ACTIVE_TRADES_KEY, sym)
+            except Exception:
+                pass
             return {"ok": True, "message": "No position"}
 
         txn = kite.TRANSACTION_TYPE_SELL if qty > 0 else kite.TRANSACTION_TYPE_BUY
@@ -1880,6 +2238,12 @@ def exit_symbol(symbol: str):
         r.delete(k_base_entry(sym))
         r.delete(k_base_qty(sym))
         r.delete(k_step(sym))
+
+        # ✅ remove from active set
+        try:
+            r.srem(ACTIVE_TRADES_KEY, sym)
+        except Exception:
+            pass
 
         return {"ok": True, "message": "Exit placed"}
     except Exception as e:
@@ -1940,7 +2304,9 @@ def dashboard():
           </div>
           <div class="tiny" style="margin-top:10px;">
             <b>Daily Max Profit:</b> {DAILY_MAX_PROFIT} (auto squareoff)<br>
-            <b>Trading Disabled:</b> <span id="tradeDisabled">-</span>
+            <b>Trading Disabled:</b> <span id="tradeDisabled">-</span><br>
+            <b>Active Trades:</b> <span id="activeTrades">-</span><br>
+            <b>Ticks Dropped:</b> <span id="ticksDropped">-</span>
           </div>
         </div>
 
@@ -1954,14 +2320,15 @@ def dashboard():
             <b>SL rule:</b> Entry - 0.8% (Fixed)<br>
             <b>Entry price range:</b> 100 to 5000<br>
             <b>Max trades:</b> {MAX_TRADES}<br>
-            <b>No new trades after:</b> 09:30 AM (Asia/Kolkata)<br>
-            <b>Breakout value:</b> LTP * 1mVolume >= 1.0cr
+            <b>No new trades after:</b> {NO_NEW_TRADES_AFTER.strftime("%H:%M")} (Asia/Kolkata)<br>
+            <b>Breakout value:</b> LTP * 1mVolume >= 1.0cr<br>
+            <b>Tick dispatch:</b> {TICK_DISPATCH_INTERVAL_MS} ms (latest tick per token)
           </div>
         </div>
       </div>
 
       <h2>Positions (MIS)</h2>
-      <div>Change SL / Target from UI. Changes apply immediately (replaces exit orders).</div>
+      <div>Change SL / Target from UI. Updates are safer: SL placed/modified first (confirmed), then old cancelled; same for Target.</div>
 
       <table>
         <thead>
@@ -2000,12 +2367,19 @@ def dashboard():
 
           hb.textContent =
             "ticks=" + (h.ticks_total ?? 0) +
+            ", dropped=" + (h.ticks_dropped_redis ?? h.ticks_dropped_local ?? 0) +
             ", tick_age_s=" + (h.last_tick_age_s ?? "-") +
             ", ws_age_s=" + (h.ws_last_event_age_s ?? "-") +
             (h.ws_last_error ? (", ws_err=" + h.ws_last_error) : "");
 
           const td = document.getElementById("tradeDisabled");
           if (td) td.textContent = (h.trading_disabled ? "YES ✅" : "NO");
+
+          const at = document.getElementById("activeTrades");
+          if (at) at.textContent = String(h.active_trades_count ?? "-");
+
+          const dr = document.getElementById("ticksDropped");
+          if (dr) dr.textContent = String(h.ticks_dropped_redis ?? h.ticks_dropped_local ?? "-");
         }}
 
         async function updateSlTarget(sym){{
@@ -2087,11 +2461,17 @@ async def startup_event():
     if not r.get(TRADES_DONE_KEY):
         r.set(TRADES_DONE_KEY, "0")
 
-    # ✅ ensure flags exist
     if not r.get(TRADING_DISABLED_KEY):
         r.set(TRADING_DISABLED_KEY, "0")
     if not r.get(SQUAREOFF_DONE_KEY):
         r.set(SQUAREOFF_DONE_KEY, "0")
+
+    # ✅ ensure keys exist
+    try:
+        if not r.get(TICKS_DROPPED_KEY):
+            r.set(TICKS_DROPPED_KEY, "0")
+    except Exception:
+        pass
 
     _start_workers_if_needed()
 
@@ -2102,8 +2482,6 @@ async def startup_event():
 
     threading.Thread(target=ltp_flush_loop, daemon=True).start()
     threading.Thread(target=positions_snapshot_loop, daemon=True).start()
-
-    # ✅ start daily max profit watcher
     threading.Thread(target=squareoff_all_positions_if_profit_hit, daemon=True).start()
 
     log.info("Startup done.")
