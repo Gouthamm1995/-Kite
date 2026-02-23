@@ -85,6 +85,9 @@ MAX_TRADES = int(os.environ.get("MAX_TRADES", "6"))
 # ✅ Daily max profit (squareoff all)
 DAILY_MAX_PROFIT = float(os.environ.get("DAILY_MAX_PROFIT", "750"))
 
+# ✅ NEW: Daily max loss (squareoff all)
+DAILY_MAX_LOSS = float(os.environ.get("DAILY_MAX_LOSS", "250"))
+
 # ✅ SL / target / trailing
 SL_PCT_BELOW_ENTRY = float(os.environ.get("SL_PCT_BELOW_ENTRY", "0.008"))  # 0.8%
 TARGET_PCT_ABOVE_ENTRY = float(os.environ.get("TARGET_PCT_ABOVE_ENTRY", "0.032"))  # 3.2%
@@ -127,6 +130,13 @@ def k_tgt_oid(sym): return f"tgt_order_id:{sym}"
 def k_base_entry(sym): return f"base_entry:{sym}"
 def k_base_qty(sym): return f"base_qty:{sym}"
 def k_step(sym): return f"trail_step:{sym}"
+
+# ✅ NEW: Opening candle + ignore persistence (day-scope)
+def k_open915(sym): return f"open915_candle:{sym}"          # JSON of 09:15 candle
+def k_ignore_day(sym): return f"ignore_day:{sym}"           # "1" means ignore rest of day
+def k_open_locked(sym): return f"open_locked_day:{sym}"     # "1" means opening locked
+def k_first_high_day(sym): return f"first_high_day:{sym}"   # float string
+def k_day_high_day(sym): return f"day_high_day:{sym}"       # float string
 
 
 # =========================
@@ -595,11 +605,11 @@ def within_new_trade_window(ts: datetime.datetime) -> bool:
 
 
 # =========================
-# ✅ DAILY MAX PROFIT WATCHER (SQUAREOFF ALL)
+# ✅ DAILY MAX PROFIT / LOSS WATCHER (SQUAREOFF ALL)
 # =========================
 def squareoff_all_positions_if_profit_hit():
     """
-    If total P&L >= DAILY_MAX_PROFIT:
+    If total P&L >= DAILY_MAX_PROFIT OR total P&L <= -DAILY_MAX_LOSS:
       - cancel SL/Target orders (best effort)
       - squareoff all open positions at market
       - disable new trades for the day
@@ -638,11 +648,17 @@ def squareoff_all_positions_if_profit_hit():
                 total_pnl += float(unreal) + float(realised)
                 open_rows.append((sym, qty))
 
-            if total_pnl >= float(DAILY_MAX_PROFIT) and open_rows:
+            hit_profit = (total_pnl >= float(DAILY_MAX_PROFIT))
+            hit_loss = (total_pnl <= -float(DAILY_MAX_LOSS))
+
+            if (hit_profit or hit_loss) and open_rows:
                 r.set(SQUAREOFF_DONE_KEY, "1")
                 r.set(TRADING_DISABLED_KEY, "1")
 
-                log.info("✅ DAILY PROFIT HIT %.2f >= %.2f. SQUAREOFF START.", total_pnl, float(DAILY_MAX_PROFIT))
+                if hit_profit:
+                    log.info("✅ DAILY PROFIT HIT %.2f >= %.2f. SQUAREOFF START.", total_pnl, float(DAILY_MAX_PROFIT))
+                else:
+                    log.info("🛑 DAILY LOSS HIT %.2f <= -%.2f. SQUAREOFF START.", total_pnl, float(DAILY_MAX_LOSS))
 
                 for sym, qty in open_rows:
                     try:
@@ -736,6 +752,15 @@ def worker_main(worker_id: int, q: mp.Queue):
             mapping = {k: (json.dumps(v) if isinstance(v, (dict, list)) else str(v)) for k, v in fields.items()}
             r_local.hset(_diag_key(sym), mapping=mapping)
             r_local.expire(_diag_key(sym), 60 * 60 * 16)
+        except Exception:
+            pass
+
+    def _expire_day_scope(key: str):
+        """
+        Expire day-scope keys safely. Keep for ~20 hours which covers "rest of day".
+        """
+        try:
+            r_local.expire(key, 60 * 60 * 20)
         except Exception:
             pass
 
@@ -1002,147 +1027,107 @@ def worker_main(worker_id: int, q: mp.Queue):
             pass
 
     # ==========================================================
-    # REST OPENING CANDLES (ONE CALL)
+    # ✅ OPENING CANDLES LOCK (WS TICKS -> 1m candles)
+    # Replaces all REST historical_data fetching.
     # ==========================================================
-    _rest_opening: Dict[str, dict] = {}
+    def try_lock_opening_from_ticks(sym: str, candle_ts: datetime.datetime, closed_candle: dict, m: dict):
+        """
+        Uses tick-built 1m candles to lock the opening pattern:
+          - When 09:15 candle closes: set first_high, open_locked, pattern_ok, ignored
+          - When 09:16 candle closes: update day_high = max(day_high, high_0916)
 
-    def fetch_opening_candles(sym: str) -> Optional[dict]:
+        ✅ Also persists:
+          - 09:15 candle JSON into Redis
+          - ignore_day lock if first candle not red
+          - open_locked/first_high/day_high into Redis (day-scope)
+        """
+        # Redis-persisted ignore check (survives restarts)
         try:
-            tok = allowed_stocks.get(sym)
-            if not tok:
-                return None
-
-            today = datetime.datetime.now(IST).date()
-            start_dt = datetime.datetime.combine(today, datetime.time(9, 15), tzinfo=IST)
-            end_dt = datetime.datetime.combine(today, datetime.time(9, 18), tzinfo=IST)
-
-            data = kite_local.historical_data(
-                instrument_token=int(tok),
-                from_date=start_dt,
-                to_date=end_dt,
-                interval="minute"
-            )
-
-            c915 = None
-            c916 = None
-
-            for c in data or []:
-                dt = c.get("date")
-                if dt is None:
-                    continue
-                if isinstance(dt, str):
-                    try:
-                        dt = datetime.datetime.fromisoformat(dt)
-                    except Exception:
-                        continue
-
-                dt = to_ist(dt)
-                if dt.date() != today:
-                    continue
-
-                if dt.hour == 9 and dt.minute == 15:
-                    c915 = c
-                elif dt.hour == 9 and dt.minute == 16:
-                    c916 = c
-
-            if not c915:
-                return None
-
-            out = {
-                "c915": {
-                    "open": float(c915["open"]),
-                    "high": float(c915["high"]),
-                    "low": float(c915["low"]),
-                    "close": float(c915["close"]),
-                },
-            }
-            if c916:
-                out["c916"] = {
-                    "open": float(c916["open"]),
-                    "high": float(c916["high"]),
-                    "low": float(c916["low"]),
-                    "close": float(c916["close"]),
-                }
-            return out
+            if (r_local.get(k_ignore_day(sym)) or "").strip() == "1":
+                m["ignored"] = True
+                return
         except Exception:
-            return None
+            pass
 
-    def try_lock_opening_from_rest(sym: str, ts: datetime.datetime, m: dict):
-        if m.get("open_locked") or m.get("ignored"):
+        if m.get("ignored"):
             return
 
-        ts = to_ist(ts)
+        ct = to_ist(candle_ts)
 
-        if ts.time() < datetime.time(9, 16):
-            return
+        # Lock on 09:15 close (this occurs right after 09:16:00 tick arrives)
+        if (not m.get("open_locked")) and ct.hour == 9 and ct.minute == 15:
+            o1 = float(closed_candle.get("open") or 0.0)
+            h1 = float(closed_candle.get("high") or 0.0)
+            l1 = float(closed_candle.get("low") or 0.0)
+            c1 = float(closed_candle.get("close") or 0.0)
 
-        now_s = time.time()
-        if now_s < float(m.get("_rest_retry_after", 0.0) or 0.0):
-            return
+            m["first_high"] = float(h1)
 
-        refresh_token(force=True)
-        if not _last_access_token:
-            if not m.get("_diag_no_token"):
-                m["_diag_no_token"] = True
-                diag_set(sym, opening_fetch_waiting_token=1, last_skip_ts=int(now_s))
-            return
+            ignored = False
+            if OPENING_PATTERN_MODE == "LEGACY":
+                red1 = (c1 < o1)
+                ignored = (not red1)
+                if ignored:
+                    m["ignore_reason"] = "first_candle_not_red"
 
-        attempts = int(m.get("_rest_attempts", 0) or 0)
-        max_attempts = int(os.environ.get("OPENING_FETCH_MAX_ATTEMPTS", "5"))
-        if attempts >= max_attempts:
             m["open_locked"] = True
-            m["ignored"] = True
-            m["pattern_ok"] = False
-            m["ignore_reason"] = "opening_fetch_failed"
-            diag_set(sym, open_locked=1, ignored=1, pattern_ok=0, ignore_reason=m["ignore_reason"])
-            return
+            m["ignored"] = bool(ignored)
+            m["pattern_ok"] = bool(not ignored)
 
-        got = _rest_opening.get(sym)
-        if not got:
-            got = fetch_opening_candles(sym)
-            if got:
-                _rest_opening[sym] = got
-
-        if not got:
-            attempts += 1
-            m["_rest_attempts"] = attempts
-            retry_s = float(os.environ.get("OPENING_FETCH_RETRY_S", "10"))
-            m["_rest_retry_after"] = now_s + retry_s
-            diag_set(sym, opening_fetch_attempts=attempts, opening_fetch_retry_after=int(m["_rest_retry_after"]))
-            return
-
-        c915 = got["c915"]
-        c916 = got.get("c916")
-
-        o1, h1, l1, cl1 = c915["open"], c915["high"], c915["low"], c915["close"]
-        m["first_high"] = float(h1)
-
-        ignored = False
-        if OPENING_PATTERN_MODE == "LEGACY":
-            red1 = (cl1 < o1)
-            ignored = (not red1)
-            if ignored:
-                m["ignore_reason"] = "first_candle_not_red"
-
-        m["open_locked"] = True
-        m["ignored"] = bool(ignored)
-        m["pattern_ok"] = bool(not ignored)
-
-        if c916:
-            m["day_high"] = float(max(h1, float(c916["high"])))
-        else:
             m["day_high"] = float(h1)
 
-        diag_set(
-            sym,
-            open_locked=1,
-            ignored=int(bool(m["ignored"])),
-            pattern_ok=int(bool(m["pattern_ok"])),
-            first_high=m["first_high"],
-            day_high=m["day_high"],
-            locked_at=ts.isoformat(),
-            ignore_reason=m.get("ignore_reason", ""),
-        )
+            # ✅ Persist the 09:15 candle + decision for the day
+            try:
+                candle_json = json.dumps({
+                    "ts": ct.isoformat(),
+                    "open": o1, "high": h1, "low": l1, "close": c1,
+                })
+                r_local.set(k_open915(sym), candle_json)
+                _expire_day_scope(k_open915(sym))
+
+                r_local.set(k_open_locked(sym), "1")
+                _expire_day_scope(k_open_locked(sym))
+
+                r_local.set(k_first_high_day(sym), str(float(h1)))
+                _expire_day_scope(k_first_high_day(sym))
+
+                r_local.set(k_day_high_day(sym), str(float(h1)))
+                _expire_day_scope(k_day_high_day(sym))
+
+                if ignored:
+                    r_local.set(k_ignore_day(sym), "1")
+                    _expire_day_scope(k_ignore_day(sym))
+            except Exception:
+                pass
+
+            diag_set(
+                sym,
+                open_locked=1,
+                ignored=int(bool(m["ignored"])),
+                pattern_ok=int(bool(m["pattern_ok"])),
+                first_high=float(m["first_high"] or 0.0),
+                day_high=float(m["day_high"] or 0.0),
+                locked_at=ct.isoformat(),
+                ignore_reason=m.get("ignore_reason", ""),
+            )
+            return
+
+        # Optionally incorporate 09:16 candle high into day_high (same behavior as REST path)
+        if m.get("open_locked") and ct.hour == 9 and ct.minute == 16:
+            h2 = float(closed_candle.get("high") or 0.0)
+            if m.get("day_high") is None:
+                m["day_high"] = float(h2)
+            else:
+                m["day_high"] = float(max(float(m["day_high"]), h2))
+
+            # ✅ Persist updated day_high
+            try:
+                r_local.set(k_day_high_day(sym), str(float(m["day_high"])))
+                _expire_day_scope(k_day_high_day(sym))
+            except Exception:
+                pass
+
+            diag_set(sym, day_high=float(m["day_high"]), day_high_update_minute=ct.isoformat())
 
     # ==========================================================
     # ✅ OCO MONITOR: ONLY ACTIVE TRADES + SLOWER POLL + BACKOFF
@@ -1279,9 +1264,23 @@ def worker_main(worker_id: int, q: mp.Queue):
                     "day_high": None,
                     "first_high": None,
                     "open_locked": False,
-                    "_rest_attempts": 0,
-                    "_rest_retry_after": 0.0,
                 }
+                # ✅ Restore persisted day-scope state (ignore/open lock) if present
+                try:
+                    if (r_local.get(k_ignore_day(sym)) or "").strip() == "1":
+                        mem[sym]["ignored"] = True
+                    if (r_local.get(k_open_locked(sym)) or "").strip() == "1":
+                        mem[sym]["open_locked"] = True
+                        fh = (r_local.get(k_first_high_day(sym)) or "").strip()
+                        dh = (r_local.get(k_day_high_day(sym)) or "").strip()
+                        if fh:
+                            mem[sym]["first_high"] = float(fh)
+                        if dh:
+                            mem[sym]["day_high"] = float(dh)
+                        mem[sym]["pattern_ok"] = (not mem[sym]["ignored"])
+                except Exception:
+                    pass
+
             m = mem[sym]
             if m["ignored"]:
                 continue
@@ -1295,10 +1294,6 @@ def worker_main(worker_id: int, q: mp.Queue):
             elif isinstance(ts, str):
                 ts = datetime.datetime.fromisoformat(ts)
             ts = to_ist(ts)
-
-            try_lock_opening_from_rest(sym, ts, m)
-            if m["ignored"]:
-                continue
 
             manage_trailing_and_pyramiding(sym, price)
 
@@ -1635,6 +1630,22 @@ def worker_main(worker_id: int, q: mp.Queue):
             c_low = float(closed["low"])
             c_close = float(closed["close"])
 
+            # ✅ lock opening from tick-built candles and persist to Redis
+            try_lock_opening_from_ticks(sym, candle_ts, closed, m)
+
+            if m.get("ignored"):
+                candle_1m[sym] = {
+                    "minute": minute_bucket,
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "vol_today_start": vol_today,
+                    "vol_today_end": vol_today,
+                }
+                maybe_entry_on_open(minute_bucket, price)
+                continue
+
             if not m.get("open_locked"):
                 candle_1m[sym] = {
                     "minute": minute_bucket,
@@ -1668,32 +1679,48 @@ def worker_main(worker_id: int, q: mp.Queue):
                                 )
 
                 elif BREAKOUT_MODE == "FIRST_CANDLE":
-                    if sym not in pending_breakout:
+                    if sym not in pending_breakout and sym not in pending_next_open:
                         first_high = float(m.get("first_high") or 0.0)
                         if first_high > 0 and candle_ts.time() >= datetime.time(9, 16):
                             c_open = float(closed.get("open") or 0.0)
                             if c_open < first_high and c_close > first_high:
                                 ok, _val = breakout_value_ok(c_close, float(vol_1m))
                                 if ok:
-                                    pending_breakout[sym] = {
-                                        "trigger": float(c_high),
-                                        "sl": float(c_low),
-                                        "set_ts": int(time.time()),
-                                        "breakout_minute": candle_ts.isoformat(),
-                                        "first_high": first_high,
-                                        "open": c_open,
-                                        "close": c_close,
-                                    }
-                                    diag_set(
-                                        sym,
-                                        pending_break_trigger=float(c_high),
-                                        pending_sl=float(c_low),
-                                        pending_set_ts=int(time.time()),
-                                        first_high=first_high,
-                                        breakout_open=c_open,
-                                        breakout_close=c_close,
-                                        breakout_vol_1m=float(vol_1m),
-                                    )
+                                    # ✅ If breakout candle is 09:16, entry must happen after it ends (09:17 open)
+                                    if candle_ts.hour == 9 and candle_ts.minute == 16:
+                                        pending_next_open[sym] = {"next_minute": minute_bucket}
+                                        diag_set(
+                                            sym,
+                                            pending_next_open=minute_bucket.isoformat(),
+                                            pending_sl=float(c_low),
+                                            pending_set_ts=int(time.time()),
+                                            first_high=first_high,
+                                            breakout_minute=candle_ts.isoformat(),
+                                            breakout_open=c_open,
+                                            breakout_close=c_close,
+                                            breakout_vol_1m=float(vol_1m),
+                                            rule="enter_after_0916_close_at_0917",
+                                        )
+                                    else:
+                                        pending_breakout[sym] = {
+                                            "trigger": float(c_high),
+                                            "sl": float(c_low),
+                                            "set_ts": int(time.time()),
+                                            "breakout_minute": candle_ts.isoformat(),
+                                            "first_high": first_high,
+                                            "open": c_open,
+                                            "close": c_close,
+                                        }
+                                        diag_set(
+                                            sym,
+                                            pending_break_trigger=float(c_high),
+                                            pending_sl=float(c_low),
+                                            pending_set_ts=int(time.time()),
+                                            first_high=first_high,
+                                            breakout_open=c_open,
+                                            breakout_close=c_close,
+                                            breakout_vol_1m=float(vol_1m),
+                                        )
 
             candle_1m[sym] = {
                 "minute": minute_bucket,
@@ -1902,6 +1929,7 @@ def positions_snapshot_loop():
                 "trades_done": int(r.get(TRADES_DONE_KEY) or "0"),
                 "max_trades": MAX_TRADES,
                 "daily_max_profit": DAILY_MAX_PROFIT,
+                "daily_max_loss": DAILY_MAX_LOSS,
                 "trading_disabled": bool((r.get(TRADING_DISABLED_KEY) or "").strip() == "1"),
                 "squareoff_done": bool((r.get(SQUAREOFF_DONE_KEY) or "").strip() == "1"),
                 "active_trades_count": int(r.scard(ACTIVE_TRADES_KEY) or 0),
@@ -1989,6 +2017,7 @@ def health():
         "ws_last_error": ws_last_error,
         "max_trades": MAX_TRADES,
         "daily_max_profit": DAILY_MAX_PROFIT,
+        "daily_max_loss": DAILY_MAX_LOSS,
         "trading_disabled": trading_disabled,
         "squareoff_done": squareoff_done,
         "active_trades_count": active_count,
@@ -2020,6 +2049,7 @@ def state():
             "trades_done": 0,
             "max_trades": MAX_TRADES,
             "daily_max_profit": DAILY_MAX_PROFIT,
+            "daily_max_loss": DAILY_MAX_LOSS,
             "trading_disabled": bool((r.get(TRADING_DISABLED_KEY) or "").strip() == "1") if redis_ok() else False,
             "squareoff_done": bool((r.get(SQUAREOFF_DONE_KEY) or "").strip() == "1") if redis_ok() else False,
             "active_trades_count": int(r.scard(ACTIVE_TRADES_KEY) or 0) if redis_ok() else 0,
@@ -2046,6 +2076,7 @@ def universe():
         "max_entry_price": MAX_ENTRY_PRICE,
         "max_trades": MAX_TRADES,
         "daily_max_profit": DAILY_MAX_PROFIT,
+        "daily_max_loss": DAILY_MAX_LOSS,
         "tick_dispatch_interval_ms": TICK_DISPATCH_INTERVAL_MS,
         "oco_poll_base_s": OCO_POLL_BASE_S,
         "oco_backoff_max_s": OCO_BACKOFF_MAX_S,
@@ -2304,6 +2335,7 @@ def dashboard():
           </div>
           <div class="tiny" style="margin-top:10px;">
             <b>Daily Max Profit:</b> {DAILY_MAX_PROFIT} (auto squareoff)<br>
+            <b>Daily Max Loss:</b> {DAILY_MAX_LOSS} (auto squareoff)<br>
             <b>Trading Disabled:</b> <span id="tradeDisabled">-</span><br>
             <b>Active Trades:</b> <span id="activeTrades">-</span><br>
             <b>Ticks Dropped:</b> <span id="ticksDropped">-</span>
@@ -2318,6 +2350,8 @@ def dashboard():
           <div class="tiny" style="margin-top:8px;">
             <b>Risk per trade:</b> 50 (Qty = 50 / (Entry - SL))<br>
             <b>SL rule:</b> Entry - 0.8% (Fixed)<br>
+            <b>Target:</b> +3.2%<br>
+            <b>Trailing step:</b> 0.8%<br>
             <b>Entry price range:</b> 100 to 5000<br>
             <b>Max trades:</b> {MAX_TRADES}<br>
             <b>No new trades after:</b> {NO_NEW_TRADES_AFTER.strftime("%H:%M")} (Asia/Kolkata)<br>
